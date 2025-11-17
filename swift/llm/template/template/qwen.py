@@ -312,11 +312,13 @@ class Qwen2VLTemplate(Template):
                 inputs.mm_processor_kwargs.setdefault('fps', []).append(video_kwargs)
                 tokens = ['<|vision_start|><|video_pad|><|vision_end|>']
             elif self.version == 'v3':
-                if video is not None:
+                if self.mode == 'vllm':
+                    tokens = ['<|vision_start|><|video_pad|><|vision_end|>']
+                else:
                     video, video_metadata = video
                     inputs.mm_processor_kwargs.setdefault('video_metadata', []).append(video_metadata)
+                    tokens = ['<|video_pad|>']
                 inputs.mm_processor_kwargs['do_sample_frames'] = False
-                tokens = ['<|video_pad|>']
             if isinstance(video, torch.Tensor):
                 video = video.to(torch.uint8)
             inputs.videos[index] = video
@@ -424,7 +426,7 @@ class Qwen2VLTemplate(Template):
         kwargs = {}
         if self.version == 'v2_5':
             kwargs = {'second_per_grid_ts': inputs.get('second_per_grid_ts')}
-        base_model = self.get_base_model(self.model)
+        base_model = self.get_base_model(self._get_model())
         if hasattr(base_model, 'get_rope_index'):
             get_rope_index = base_model.get_rope_index
         else:
@@ -586,7 +588,10 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
                 if self.version == 'omni_v2_5':
                     return ['<|vision_bos|><|audio_bos|><|VIDEO|><|audio_eos|><|vision_eos|>']
                 elif self.version == 'omni_v3':
-                    return ['<|vision_start|><|audio_start|><|video_pad|><|audio_end|><|vision_end|>']
+                    if self.mode == 'vllm':
+                        return ['<|vision_start|><|video_pad|><|vision_end|>']
+                    else:
+                        return ['<|vision_start|><|audio_start|><|video_pad|><|audio_end|><|vision_end|>']
             if self.version == 'omni_v2_5':
                 return ['<|vision_bos|><|VIDEO|><|vision_eos|>']
             elif self.version == 'omni_v3':
@@ -765,10 +770,12 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
             audio_feature_lengths = None
         video_second_per_grid = inputs.pop('video_second_per_grid', None)
         input_ids = inputs['input_ids']
-        attention_mask = inputs.get('attention_mask')
+        attention_mask = inputs.get('attention_mask_2d')
+        if attention_mask is None:
+            attention_mask = inputs.get('attention_mask')
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
-        position_ids, _ = self.model.thinker.get_rope_index(
+        position_ids, _ = self._get_model().thinker.get_rope_index(
             input_ids,
             inputs.get('image_grid_thw'),
             inputs.get('video_grid_thw'),

@@ -1,31 +1,45 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import inspect
+import os
 import random
-from collections import defaultdict
-from contextlib import nullcontext
-from typing import Any, Dict, Optional, Union
+from collections import defaultdict, deque
+from contextlib import contextmanager, nullcontext
+from copy import deepcopy
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from accelerate.utils import gather_object
 from transformers import PreTrainedModel
 from trl import GKDTrainer as HFGKDTrainer
 from trl import SFTTrainer as HFSFTTrainer
-from trl.models.utils import prepare_deepspeed
 
-from swift.utils import unwrap_model_for_generation
+from swift.llm.template.template_inputs import TemplateInputs
+from swift.utils import (JsonlWriter, get_logger, is_swanlab_available, is_wandb_available, remove_response,
+                         unwrap_model_for_generation)
 from ..mixin import SwiftMixin
-from .rlhf_mixin import RLHFTrainerMixin
+from .rollout_mixin import DataType, RolloutTrainerMixin
+from .utils import identity_data_collator, patch_profiling_context, patch_profiling_decorator, prepare_deepspeed
 
 del HFGKDTrainer.__init__
 del HFSFTTrainer.__init__
 
+logger = get_logger()
+if is_wandb_available():
+    import wandb
+if is_swanlab_available():
+    import swanlab
 
-class GKDTrainer(RLHFTrainerMixin, SwiftMixin, HFGKDTrainer):
+
+class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
     def __init__(self, model: Optional[Union[PreTrainedModel, nn.Module, str]] = None, *_args, **kwargs):
         teacher_model = kwargs.pop('teacher_model')
-        super().__init__(model, *_args, **kwargs)
+        teacher_deepspeed_config = kwargs.pop('teacher_deepspeed_config', None)
+        self.vllm_client = kwargs.pop('vllm_client', None)
+        kwargs['data_collator'] = identity_data_collator
+        super().__init__(model, None, *_args, **kwargs)
         args = kwargs['args']
         self.lmbda = args.lmbda
         self.temperature = args.temperature
@@ -33,11 +47,30 @@ class GKDTrainer(RLHFTrainerMixin, SwiftMixin, HFGKDTrainer):
         self.generation_config = model.generation_config
         self._metrics = {'train': defaultdict(list), 'eval': defaultdict(list)}
         self._total_train_tokens = 0
+
+        # Initialize logging components
+        self._prepare_logging()
+        self.teacher_ds3_gather_for_generation = args.ds3_gather_for_generation
+        # Initialize teacher model
         if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            if teacher_deepspeed_config is not None:
+                if teacher_deepspeed_config.get('zero_optimization', {}).get('stage') != 3:
+                    self.teacher_ds3_gather_for_generation = False
+                self.teacher_model = prepare_deepspeed(
+                    teacher_model, self.accelerator, deepspeed_config=teacher_deepspeed_config, training_args=args)
+            else:
+                self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
         else:
             self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
         self.teacher_model.eval()
+        if self.args.offload_teacher_model:
+            self.offload_model(self.accelerator.unwrap_model(self.teacher_model))
+
+        # Initialize rollout infrastructure for vLLM support
+        if args.use_vllm:
+            self.prepare_rollout()
+            logger.info('vLLM engine initialized for GKD training')
+
         # Initialize activation offloading context
         args.activation_offloading = False  # TODO: remove
         if args.activation_offloading:
@@ -83,6 +116,7 @@ class GKDTrainer(RLHFTrainerMixin, SwiftMixin, HFGKDTrainer):
         inputs['position_ids'] = new_position_ids
         return generated_tokens, new_attention_mask, new_labels
 
+    @patch_profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         model_inputs = {k: v for k, v in inputs.items() if k not in {'prompt', 'labels'}}
         # If generate is used, then use_logits_to_keep must be set to False.
@@ -96,7 +130,8 @@ class GKDTrainer(RLHFTrainerMixin, SwiftMixin, HFGKDTrainer):
         outputs_student = model(**model_inputs)
 
         model_inputs.pop('labels', None)
-        with torch.no_grad():
+        load_context = self.load_teacher_model_context() if self.args.offload_teacher_model else nullcontext()
+        with torch.no_grad(), load_context:
             outputs_teacher = self.teacher_model(**model_inputs)
 
         shifted_labels = torch.roll(inputs['labels'], shifts=-1, dims=1)
@@ -126,10 +161,28 @@ class GKDTrainer(RLHFTrainerMixin, SwiftMixin, HFGKDTrainer):
         # Return loss
         return (loss, outputs_student) if return_outputs else loss
 
+    def _prepare_batch_inputs(self, inputs: list) -> Dict[str, torch.Tensor]:
+        template = self.template
+        batch_encoded_inputs = []
+
+        for data in inputs:
+            if 'response_token_ids' in data and data['response_token_ids']:
+                from .utils import replace_assistant_response_with_ids
+                data['messages'] = replace_assistant_response_with_ids(data['messages'], data['response_token_ids'])
+
+            encoded = template.encode(data, return_length=True)
+            batch_encoded_inputs.append(encoded)
+
+        from swift.llm import to_device
+        batch_encoded = to_device(template.data_collator(batch_encoded_inputs), self.model.device)
+
+        return batch_encoded
+
     # Code borrowed from huggingface/trl
+    @patch_profiling_decorator
     def training_step(self,
                       model: nn.Module,
-                      inputs: Dict[str, Union[torch.Tensor, Any]],
+                      inputs: DataType,
                       num_items_in_batch: Optional[int] = None) -> torch.Tensor:
         """
         Perform a training step for the Generalized Knowledge Distillation (GKD) model.
@@ -137,33 +190,178 @@ class GKDTrainer(RLHFTrainerMixin, SwiftMixin, HFGKDTrainer):
         This method implements the on-policy learning approach described in the GKD paper.
         With probability `self.lmbda`, it generates new responses using the student model,
         which are then used for training instead of the original inputs.
-        """
 
-        if random.random() <= self.lmbda:
-            with unwrap_model_for_generation(
-                    model, self.accelerator,
-                    gather_deepspeed3_params=self.args.ds3_gather_for_generation) as unwrapped_model:
-                unwrapped_model.eval()  # Remove the gradient_checkpointing warning.
-                new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
-                    unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id)
-                unwrapped_model.train()
-            inputs['input_ids'] = new_input_ids
-            inputs['attention_mask'] = new_attention_mask
-            inputs['labels'] = new_labels
-        elif self.seq_kd:
-            with unwrap_model_for_generation(
-                    self.teacher_model, self.accelerator,
-                    gather_deepspeed3_params=self.args.ds3_gather_for_generation) as unwrapped_model:
-                new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
-                    unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id)
-            inputs['input_ids'] = new_input_ids
-            inputs['attention_mask'] = new_attention_mask
-            inputs['labels'] = new_labels
+        When use_vllm is enabled, vLLM engine is used for faster generation.
+        """
+        args = self.args
+        with patch_profiling_context(self, 'get_completions'):
+            if self._get_random_num() <= self.lmbda:
+                # On-policy: student model generates responses
+                if args.use_vllm:
+                    processed_inputs = self._preprocess_inputs(inputs)
+                    generated_inputs = self._fast_infer(processed_inputs)
+                    if self.log_completions:
+                        messages = [inp['messages'][:-1] for inp in generated_inputs]
+                        completions = [deepcopy(inp['messages'][-1]['content']) for inp in generated_inputs]
+                        valid_messages = gather_object(messages)
+                        valid_completions = gather_object(completions)
+                        self._logs['prompt'].extend(self._apply_chat_template_to_messages_list(valid_messages))
+                        self._logs['completion'].extend(valid_completions)
+                    inputs = self._prepare_batch_inputs(generated_inputs)
+                else:
+                    inputs = self._prepare_batch_inputs(inputs)
+                    with unwrap_model_for_generation(
+                            model, self.accelerator,
+                            gather_deepspeed3_params=args.ds3_gather_for_generation) as unwrapped_model:
+                        unwrapped_model.eval()
+                        new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
+                            unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id)
+                        unwrapped_model.train()
+                    inputs['input_ids'] = new_input_ids
+                    inputs['attention_mask'] = new_attention_mask
+                    inputs['labels'] = new_labels
+
+            elif self.seq_kd:
+                inputs = self._prepare_batch_inputs(inputs)
+                load_context = self.load_teacher_model_context() if self.args.offload_teacher_model else nullcontext()
+                with load_context, unwrap_model_for_generation(
+                        self.teacher_model,
+                        self.accelerator,
+                        gather_deepspeed3_params=self.teacher_ds3_gather_for_generation) as unwrapped_model:
+                    new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
+                        unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id)
+                inputs['input_ids'] = new_input_ids
+                inputs['attention_mask'] = new_attention_mask
+                inputs['labels'] = new_labels
+
+            else:
+                inputs = self._prepare_batch_inputs(inputs)
 
         with self.template.forward_context(self.model, inputs):
             loss = HFSFTTrainer.training_step(self, model, inputs, num_items_in_batch)
         return loss
 
     def prediction_step(self, model, inputs, *args, **kwargs):
+        inputs = self._prepare_batch_inputs(inputs)
         with self.template.forward_context(self.model, inputs):
             return super().prediction_step(model, inputs, *args, **kwargs)
+
+    @contextmanager
+    def offload_context(self):
+        """Context manager for offloading model and optimizer during vLLM inference
+
+        This offloads:
+        - Student model (self.model)
+        - Optimizer states
+
+        to CPU to free up GPU memory for vLLM engine.
+        """
+        if self.args.offload_model:
+            self.offload_model(self.accelerator.unwrap_model(self.model))
+        if getattr(self, 'optimizer', None) and self.args.offload_optimizer:
+            self.offload_optimizer()
+
+        try:
+            yield
+        finally:
+            # reload (load back) model when exiting context
+            if self.args.offload_model:
+                self.load_model(self.accelerator.unwrap_model(self.model))
+            if getattr(self, 'optimizer', None) and self.args.offload_optimizer:
+                self.load_optimizer()
+
+    def _get_random_num(self) -> float:
+        """
+        Generate a deterministic random number.
+
+        Uses an isolated Random instance to avoid interfering with the global
+        random state, ensuring thread-safety and consistent behavior across processes.
+
+        Returns:
+            float: A random number in the range [0.0, 1.0).
+        """
+        seed = int(getattr(self.args, 'seed', 0))
+        seed += int(self.state.global_step)
+        rng = random.Random(seed)
+        return rng.random()
+
+    @contextmanager
+    def load_teacher_model_context(self):
+        """
+        Context manager to load and offload the teacher model with memory and timing profiling.
+        """
+        if not self.args.offload_teacher_model:
+            yield
+            return
+
+        self.load_model(self.accelerator.unwrap_model(self.teacher_model))
+        yield
+        self.offload_model(self.accelerator.unwrap_model(self.teacher_model))
+
+    def _prepare_logging(self):
+        """Initialize logging components for on-policy rollout tracking."""
+        args = self.args
+        self.log_completions = args.log_completions
+        self.wandb_log_unique_prompts = getattr(args, 'wandb_log_unique_prompts', False)
+        self.jsonl_writer = JsonlWriter(os.path.join(self.args.output_dir, 'completions.jsonl'))
+
+        # Initialize logs deque for storing rollout data (aligned with GRPO)
+        self._logs = {
+            'prompt': deque(),
+            'completion': deque(),
+        }
+
+    def _apply_chat_template_to_messages_list(self, messages_list: DataType):
+        """Convert messages list to prompt text list using template (aligned with GRPO)."""
+        prompts_text = []
+        for messages in messages_list:
+            remove_response(messages)
+            template_inputs = TemplateInputs.from_dict({'messages': messages})
+            res = self.template.encode(template_inputs)
+            prompts_text.append(self.template.safe_decode(res['input_ids']))
+        return prompts_text
+
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        """Override log method to include completion table logging (aligned with GRPO)."""
+        # Call parent log method
+        import transformers
+        from packaging import version
+        if version.parse(transformers.__version__) >= version.parse('4.47.0.dev0'):
+            super().log(logs, start_time)
+        else:
+            super().log(logs)
+
+        # Log completions table if we have data (only for on-policy generations)
+        if self.accelerator.is_main_process and self.log_completions and len(self._logs['prompt']) > 0:
+            seen_nums = len(self._logs['prompt'])
+            table = {
+                'step': [str(self.state.global_step)] * seen_nums,
+                'prompt': list(self._logs['prompt'])[:seen_nums],
+                'completion': list(self._logs['completion'])[:seen_nums],
+            }
+
+            # Write to jsonl
+            self.jsonl_writer.append(table)
+
+            self._logs['prompt'].clear()
+            self._logs['completion'].clear()
+            # Log to wandb if enabled
+            report_to_wandb = self.args.report_to and 'wandb' in self.args.report_to and wandb.run is not None
+            if report_to_wandb:
+                wandb_table = table.copy()
+                import pandas as pd
+                df = pd.DataFrame(wandb_table)
+                if self.wandb_log_unique_prompts:
+                    df = df.drop_duplicates(subset=['prompt'])
+                wandb.log({'completions': wandb.Table(dataframe=df)})
+
+            # Log to swanlab if enabled
+            report_to_swanlab = self.args.report_to and 'swanlab' in self.args.report_to and swanlab.get_run(
+            ) is not None
+            if report_to_swanlab:
+                headers = list(table.keys())
+                rows = []
+                for i in range(len(table['step'])):
+                    row = [table[header][i] for header in headers]
+                    rows.append(row)
+                swanlab.log({'completions': swanlab.echarts.Table().add(headers, rows)})

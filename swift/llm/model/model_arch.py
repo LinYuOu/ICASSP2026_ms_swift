@@ -46,6 +46,7 @@ class MLLMModelArch:
     llava_hf = 'llava_hf'
     llava_hf_legacy = 'llava_hf_legacy'  # transformers<4.52
     llava_next_video_hf = 'llava_next_video_hf'
+    llava_onevision1_5 = 'llava_onevision1_5'
 
     llava_llama = 'llava_llama'
     llava_mistral = 'llava_mistral'
@@ -57,6 +58,7 @@ class MLLMModelArch:
     deepseek_vl = 'deepseek_vl'
     deepseek_vl2 = 'deepseek_vl2'
     deepseek_janus = 'deepseek_janus'
+    deepseek_ocr = 'deepseek_ocr'
 
     mplug_owl2 = 'mplug_owl2'
     mplug_owl2_1 = 'mplug_owl2_1'
@@ -70,6 +72,7 @@ class MLLMModelArch:
 
     got_ocr2 = 'got_ocr2'
     dots_ocr = 'dots_ocr'
+    ernie_vl = 'ernie_vl'
 
     ovis = 'ovis'
     ovis2_5 = 'ovis2_5'
@@ -437,6 +440,14 @@ register_model_arch(
 
 register_model_arch(
     MultiModelKeys(
+        MLLMModelArch.deepseek_ocr,
+        language_model='model.layers',
+        vision_tower=['model.sam_model', 'model.vision_model'],
+        aligner='model.projector',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
         MLLMModelArch.deepseek_vl2,
         language_model='language',
         vision_tower='vision',
@@ -609,6 +620,14 @@ register_model_arch(
         vision_tower='model.vision_tower_high',
     ))
 
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.ernie_vl,
+        language_model='model',
+        aligner='model.resampler_model',
+        vision_tower='vision_model',
+    ))
+
 if transformers_ge_4_52:
     register_model_arch(
         MultiModelKeys(
@@ -695,6 +714,14 @@ register_model_arch(MultiModelKeys(
     MLLMModelArch.dots_ocr,
     language_model='model',
 ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.llava_onevision1_5,
+        language_model='model.language_model',
+        aligner='model.visual.merger',
+        vision_tower='model.visual',
+    ))
 
 
 def get_model_arch(arch_name: Optional[str]) -> Optional[MultiModelKeys]:

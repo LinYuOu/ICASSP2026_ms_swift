@@ -22,11 +22,8 @@ class LLMModelType:
     qwen3_next = 'qwen3_next'
     qwen3_next_thinking = 'qwen3_next_thinking'
     qwen3_emb = 'qwen3_emb'
-    qwen3_reranker = 'qwen3_reranker'
 
     qwen2_gte = 'qwen2_gte'
-
-    bge_reranker = 'bge_reranker'
 
     codefuse_qwen = 'codefuse_qwen'
     modelscope_agent = 'modelscope_agent'
@@ -108,6 +105,7 @@ class LLMModelType:
 
     minimax = 'minimax'
     minimax_m1 = 'minimax_m1'
+    minimax_m2 = 'minimax_m2'
 
     gemma = 'gemma'
     gemma2 = 'gemma2'
@@ -132,6 +130,7 @@ class LLMModelType:
     polylm = 'polylm'
     aya = 'aya'
     moonlight = 'moonlight'
+    kimi_k2 = 'kimi_k2'
     mimo = 'mimo'
     mimo_rl = 'mimo_rl'
     dots1 = 'dots1'
@@ -146,7 +145,6 @@ class LLMModelType:
 class BertModelType:
     modern_bert = 'modern_bert'
     modern_bert_gte = 'modern_bert_gte'
-    modern_bert_gte_reranker = 'modern_bert_gte_reranker'
     bert = 'bert'
 
 
@@ -218,6 +216,8 @@ class MLLMModelType:
     llava_next_video_yi_hf = 'llava_next_video_yi_hf'
     llava_onevision_hf = 'llava_onevision_hf'
     yi_vl = 'yi_vl'
+    ernie_vl = 'ernie_vl'
+    ernie_vl_thinking = 'ernie_vl_thinking'
 
     llava_llama3_1_hf = 'llava_llama3_1_hf'  # DaozeZhang
     llava_llama3_hf = 'llava_llama3_hf'  # xtuner
@@ -226,11 +226,13 @@ class MLLMModelType:
     llava1_6_yi = 'llava1_6_yi'
     llava_next_qwen = 'llava_next_qwen'
     llama3_llava_next = 'llama3_llava_next'
+    llava_onevision1_5 = 'llava_onevision1_5'
 
     deepseek_vl = 'deepseek_vl'
     deepseek_vl2 = 'deepseek_vl2'
     deepseek_janus = 'deepseek_janus'
     deepseek_janus_pro = 'deepseek_janus_pro'
+    deepseek_ocr = 'deepseek_ocr'
 
     minicpmv = 'minicpmv'
     minicpmv2_5 = 'minicpmv2_5'
@@ -272,9 +274,17 @@ class MLLMModelType:
     gemma3_vision = 'gemma3_vision'
     gemma3n = 'gemma3n'
     mistral_2503 = 'mistral_2503'
+    paddle_ocr = 'paddle_ocr'
 
 
-class ModelType(LLMModelType, MLLMModelType, BertModelType, RMModelType):
+class RerankerModelType:
+    bge_reranker = 'bge_reranker'
+    modern_bert_gte_reranker = 'modern_bert_gte_reranker'
+    jina_reranker_m0 = 'jina_reranker_m0'
+    qwen3_reranker = 'qwen3_reranker'
+
+
+class ModelType(LLMModelType, MLLMModelType, BertModelType, RMModelType, RerankerModelType):
 
     @classmethod
     def get_model_name_list(cls) -> List[str]:
@@ -292,4 +302,4 @@ class ModelType(LLMModelType, MLLMModelType, BertModelType, RMModelType):
         return list(
             chain.from_iterable(
                 _get_model_name_list(model_type_cls)
-                for model_type_cls in [LLMModelType, MLLMModelType, BertModelType, RMModelType]))
+                for model_type_cls in [LLMModelType, MLLMModelType, BertModelType, RMModelType, RerankerModelType]))

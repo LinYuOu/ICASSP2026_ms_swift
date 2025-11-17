@@ -91,7 +91,7 @@ class Template(ProcessorMixin):
         from .template_meta import TemplateMeta
         from swift.plugin import agent_templates, loss_scale_map
         self._processor_inited = False
-        self._version = 'v3'  # Avoid compatibility issues caused by load_from_cache_file caching.
+        self._version = 'v4'  # Avoid compatibility issues caused by load_from_cache_file caching.
         self.max_length = max_length
         self.model = None
         self.dummy_model = None
@@ -357,11 +357,16 @@ class Template(ProcessorMixin):
         else:
             return model
 
-    def _rlhf_encode(self, inputs: TemplateInputs) -> Dict[str, Any]:
+    def _rlhf_encode(self, inputs: TemplateInputs, check_rejected=True) -> Dict[str, Any]:
         chosen = inputs.chosen
         margin = chosen.margin
         chosen_encoded = self._encode_truncated(chosen)
-        rejected_encoded = self._encode_truncated(inputs.rejected)
+        if inputs.rejected is None:
+            if check_rejected:
+                raise ValueError('inputs.rejected is None')
+            rejected_encoded = {}
+        else:
+            rejected_encoded = self._encode_truncated(inputs.rejected)
 
         encoded = {}
         for prefix in ['chosen', 'rejected']:
@@ -373,7 +378,7 @@ class Template(ProcessorMixin):
         return encoded
 
     def _kto_encode(self, inputs: TemplateInputs) -> Dict[str, Any]:
-        encoded = self._rlhf_encode(inputs)
+        encoded = self._rlhf_encode(inputs, check_rejected=False)
         encoded['label'] = bool(inputs.chosen.label)
         return encoded
 
@@ -436,6 +441,9 @@ class Template(ProcessorMixin):
                 if instruction is not None and positive.system is None:
                     positive.system = instruction
                 positive.messages = chosen.messages + positive.messages
+                positive.images = chosen.images + positive.images
+                positive.audios = chosen.audios + positive.audios
+                positive.videos = chosen.videos + positive.videos
                 positive_encoded = self._encode_truncated(positive)
                 labels.append(1)
                 for key in positive_encoded:
@@ -445,6 +453,9 @@ class Template(ProcessorMixin):
                 if instruction is not None and negative.system is None:
                     negative.system = instruction
                 negative.messages = chosen.messages + negative.messages
+                negative.images = chosen.images + negative.images
+                negative.audios = chosen.audios + negative.audios
+                negative.videos = chosen.videos + negative.videos
                 negative_encoded = self._encode_truncated(negative)
                 labels.append(0)
                 for key in negative_encoded:
@@ -992,6 +1003,8 @@ class Template(ProcessorMixin):
         kwargs = {}
         if inputs.tools:
             kwargs['tools'] = inputs.tools
+        if 'thinking_budget' in inputs.extra_kwargs:
+            kwargs['thinking_budget'] = inputs.extra_kwargs.get('thinking_budget', 0)
         text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=add_generation_prompt, **kwargs)
         answer_len = 1 if self.is_training else 0
@@ -1126,7 +1139,11 @@ class Template(ProcessorMixin):
                     if isinstance(stop_word, str))
                 # self.is_training needed because we may want to continue generation from
                 # the current response
-                if (self.is_training or self.task_type != 'causal_lm') and not sep_token and not endswith_stop_words:
+                add_eos = inputs.extra_kwargs.get('add_eos')
+                if add_eos is None:
+                    add_eos = (self.is_training
+                               or self.task_type != 'causal_lm') and not sep_token and not endswith_stop_words
+                if add_eos:
                     extra_context_list = template_meta.suffix
                     extra_context_type = ContextType.SUFFIX
             elif template_meta.response_prefix:
@@ -1200,7 +1217,6 @@ class Template(ProcessorMixin):
                     encoded[key] = value
         else:
             encoded = self._encode(inputs)
-        self._handle_megatron_cp(encoded)  # TODO: fix cp_size & cached_dataset
         input_ids = encoded.get('input_ids')
         labels = encoded.get('labels')
         loss_scale = encoded.get('loss_scale')
@@ -1263,16 +1279,25 @@ class Template(ProcessorMixin):
                     encoded[k] = None
         return encoded
 
-    def _handle_megatron_cp(self, encoded: Dict[str, Any]) -> None:
+    def _get_megatron_cp_length(self, length) -> int:
+        cp_size = self.sequence_parallel_size
+        if not self.use_megatron or cp_size == 1:
+            return length
+        return math.ceil(length / (cp_size * 2)) * (cp_size * 2)
+
+    def _handle_megatron_cp(self, batch: List[Dict[str, Any]]) -> None:
         cp_size = self.sequence_parallel_size
         if not self.use_megatron or cp_size == 1:
             return
-        input_ids = encoded['input_ids']
-        padding_len = math.ceil(len(input_ids) / (cp_size * 2)) * (cp_size * 2) - len(input_ids)
-        input_ids += [self.tokenizer.pad_token_id] * padding_len
-        encoded['labels'] += [-100] * padding_len
-        if encoded.get('loss_scale') is not None:
-            encoded['loss_scale'] += [0] * padding_len
+        for encoded in batch:
+            input_ids = encoded['input_ids']
+            padding_len = math.ceil(len(input_ids) / (cp_size * 2)) * (cp_size * 2) - len(input_ids)
+            input_ids += [self.tokenizer.pad_token_id] * padding_len
+            encoded['labels'] += [-100] * padding_len
+            if encoded.get('loss_scale') is not None:
+                encoded['loss_scale'] += [0] * padding_len
+            if encoded.get('length') is not None:
+                encoded['length'] += padding_len
 
     def debug_logger(self, inputs):
         if not strtobool(os.getenv('SWIFT_DEBUG', 'false')):
@@ -1477,7 +1502,10 @@ class Template(ProcessorMixin):
         kl_batch = self._fetch_inputs_startswith(batch, 'rejected_')
 
         res = self._data_collator(new_batch, padding_to=padding_to)
-        kl_res = self._data_collator(kl_batch, padding_to=padding_to)
+        if any(kl_batch):
+            kl_res = self._data_collator(kl_batch, padding_to=padding_to)
+        else:
+            kl_res = {}
         res = {
             **{f'completion_{k}': v
                for k, v in res.items()},
@@ -1546,12 +1574,14 @@ class Template(ProcessorMixin):
                 max_positive = min(positive_num, max_positive_samples)
                 max_negative = min(negative_num, max_negative_samples)
                 for i in random.sample(range(positive_num), max_positive):
-                    new_batch.append({'input_ids': b['input_ids'][i], 'length': b['length'][i]})
+                    new_batch.append(
+                        {key: b[key][i]
+                         for key in b.keys() if isinstance(b[key], list) and b[key][i] is not None})
                     labels_list.append(1)
                     for j in random.sample(range(negative_num), max_negative):
                         new_batch.append({
-                            'input_ids': b['input_ids'][j + positive_num],
-                            'length': b['length'][j + positive_num]
+                            key: b[key][j + positive_num]
+                            for key in b.keys() if isinstance(b[key], list) and b[key][j + positive_num] is not None
                         })
                         labels_list.append(0)
 
@@ -1561,7 +1591,7 @@ class Template(ProcessorMixin):
         else:
             new_batch = []
             for b in batch:
-                new_batch.append({'input_ids': b['input_ids']})
+                new_batch.append({key: val for key, val in b.items() if isinstance(val, list)})
             res = self._data_collator(new_batch, padding_to=padding_to)
         return res
 
@@ -1595,6 +1625,7 @@ class Template(ProcessorMixin):
         assert self.tokenizer.pad_token_id is not None
         padding_side = self.padding_side if self.is_training else 'left'
         padding_right = padding_side == 'right'
+        self._handle_megatron_cp(batch)
         if self.padding_free:
             batch[:] = [self.packing_row(batch)]
             assert 'position_ids' in batch[0], f'batch[0]: {batch[0]}'
@@ -1677,6 +1708,7 @@ class Template(ProcessorMixin):
                 assert res['attention_mask'].dtype is torch.bool, f'attention_mask.dtype: {res["attention_mask"].dtype}'
                 for i, seq_len in enumerate(seq_lens):
                     res['attention_mask'][i, :, seq_len:] = 0
+                res['attention_mask'] = ~res['attention_mask']
 
         for key, pad_value in zip(keys, pad_values):
             if key not in res:
@@ -1854,7 +1886,7 @@ class Template(ProcessorMixin):
         Returns:
             A tensor after padding
         """
-        padding_side = self.padding_side if self.is_training and self.task_type != 'generative_reranker' else 'left'
+        padding_side = self.padding_side if self.is_training else 'left'
         padding_right = padding_side == 'right'
         if padding_right:
             return pad_sequence(sequences, batch_first=True, padding_value=padding_value)

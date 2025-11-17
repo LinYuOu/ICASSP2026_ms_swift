@@ -70,9 +70,6 @@ class DeployArguments(InferArguments):
     def _init_stream(self):
         return BaseArguments._init_stream(self)
 
-    def _init_eval_human(self):
-        pass
-
     def _init_result_path(self, folder_name: str) -> None:
         if folder_name == 'infer_result':
             folder_name = 'deploy_result'
@@ -112,6 +109,9 @@ class RolloutArguments(DeployArguments):
                 self.vllm_use_async_engine = True
             else:
                 self.vllm_use_async_engine = False
+
+        if self.use_gym_env is None:
+            self.use_gym_env = self.gym_env is not None
 
     def _check_args(self):
         if self.vllm_pipeline_parallel_size > 1:

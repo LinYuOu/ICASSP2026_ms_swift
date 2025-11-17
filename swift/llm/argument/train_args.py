@@ -170,7 +170,7 @@ class TrainArguments(SwanlabArguments, TunerArguments, BaseArguments, Seq2SeqTra
 
         if getattr(self, 'accelerator_config', None) is None:
             self.accelerator_config = {'dispatch_batches': False}
-        if self.split_dataset_ratio == 0 and not self.val_dataset and not self.eval_dataset:
+        if not (self.eval_dataset or self._val_dataset_exists):
             self.eval_strategy = 'no'
         self.training_args = TrainerFactory.get_training_args(self)
         self.training_args.remove_unused_columns = False
@@ -182,7 +182,7 @@ class TrainArguments(SwanlabArguments, TunerArguments, BaseArguments, Seq2SeqTra
     def _init_deepspeed(self):
         if self.deepspeed:
             require_version('deepspeed')
-            if is_mp():
+            if is_mp() and not self.use_ray:
                 raise ValueError('DeepSpeed is not compatible with `device_map`. '
                                  f'n_gpu: {get_device_count()}, '
                                  f'local_world_size: {self.local_world_size}.')
