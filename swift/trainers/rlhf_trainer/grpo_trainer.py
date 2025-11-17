@@ -1041,7 +1041,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         rewards_per_func = torch.zeros((len(inputs), len(self.reward_funcs)), device=device)
         completions = [inp['messages'][-1]['content'] for inp in inputs]
         history = [inp['messages'][:-1] for inp in inputs]
-        last_audios = [inp['audios'][-1] if inp.get('audios') else None for inp in inputs]
+        extra_info = [inp.get('extra_info', None) for inp in inputs]
+        # last_user_audios = [inp['audios'][-1] if inp.get('audios') else None for inp in inputs]
         for i, (reward_func, reward_model_plugin, reward_func_name) in enumerate(
                 zip(self.reward_funcs, self.reward_model_plugins, self.reward_func_names)):
             with patch_profiling_context(self, reward_func_name):
@@ -1059,20 +1060,13 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     
                     ####################################
                     # !!!!!!!!!!!!!!!!!!!!!!!!!!!! #
-                    # 把 inputs 存到txt里边
-                    # 从环境变量读取
-                    OLY_DEBUG = os.environ.get("OLY_DEBUG", "False").lower() in ("true", "1", "t")
-                    if OLY_DEBUG:
-                        debug_path = "/mnt/afs/oulinyu/ICASSP2026/swift_exp/debug.txt"
-                        with open(debug_path, "a", encoding="utf-8") as f:
-                            f.write(json.dumps(inputs, ensure_ascii=False, indent=2))
-                            f.write("\n\n")
-                        output_reward_func = reward_func(completions, history, **reward_kwargs)
+                    reward_kwargs.update({
+                        "history": history,
+                        "extra_info": extra_info
+                    })
                     # !!!!!!!!!!!!!!!!!!!!!!!!!!!! #
                     ####################################
-                    
-                    else:
-                        output_reward_func = reward_func(completions, **reward_kwargs)
+                    output_reward_func = reward_func(completions, **reward_kwargs)
                 output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 

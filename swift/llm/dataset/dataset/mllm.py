@@ -1239,3 +1239,29 @@ register_dataset(
         hf_dataset_id='leonardPKU/clevr_cogen_a_train',
         preprocess_func=ClevrPreprocessor(),
         tags=['qa', 'math', 'vision', 'grpo']))
+
+class MyPreprocessor(ResponsePreprocessor):  
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:  
+        # 先调用父类处理标准字段  
+        OLY_DEBUG = os.environ.get("OLY_DEBUG", "False").lower() in ("true", "1", "t")
+        # if OLY_DEBUG:
+        #     print('ori_row',row)
+        '''
+        ori_row {'messages': [{'role': 'user', 'content': '<audio>\n'}, {'role': 'assistant', 'content': '听到你因为明天的报告紧张得整晚没睡好，我完全能理解这种压力。当众演讲确实容易让人手心出汗，这种忐忑的心情是很真实的。'}, {'role': 'user', 'content': '<audio>\n'}, {'role': 'assistant', 'content': '好朋友临时不能来支持你，这一定让你感到特别失落和孤单。原本期待的重要时刻少了支柱，心里空落落的很难受。'}, {'role': 'user', 'content': '<audio>\n'}], 'audios': ['/mnt/afs/randongchuan/Dataset/ICASSP2026/HD-Track1/HD-Track1-train/HD-Track1-train-zh/task1_3/zh_0144_0006_1.wav', '/mnt/afs/randongchuan/Dataset/ICASSP2026/HD-Track1/HD-Track1-train/HD-Track1-train-zh/task1_3/zh_0144_0006_2.wav', '/mnt/afs/randongchuan/Dataset/ICASSP2026/HD-Track1/HD-Track1-train/HD-Track1-train-zh/task1_3/zh_0144_0006_3.wav'], 'extra_info': ['天哪，明天就要当着全公司的面做报告了，我现在手心都是汗，[哈欠声] 紧张得一晚上没睡好。', '唉，我本来还指望我最好的朋友能来现场给我打气的... [哭腔] 他刚发消息说公司临时有急事，来不了了。', '你能帮我概括一下，刚才我的情绪状态是如何演变的吗？']}
+        '''
+        result = super().preprocess(row)  
+        # if OLY_DEBUG:
+        #     print("xxresult", result)
+        result['messages'] = row['messages']
+        result['audios'] = row['audios']
+        # 保留 external_info 字段  
+        if 'extra_info' in row:  
+            result['extra_info'] = row['extra_info']  
+          
+        return result  
+  
+register_dataset(DatasetMeta(  
+    dataset_name='task1_3_GRPO_extra_info',  
+    dataset_path='/mnt/afs/oulinyu/Dataset/ICASSP2026/GRPO_extra_info/task1_3_GRPO_extra_info.jsonl',  
+    preprocess_func=MyPreprocessor()  
+))

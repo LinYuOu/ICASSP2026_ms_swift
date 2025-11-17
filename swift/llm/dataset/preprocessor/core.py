@@ -374,6 +374,8 @@ class ResponsePreprocessor(RowPreprocessor):
             self.columns[key] = 'response'
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if 'messages' in row and isinstance(row['messages'], list) and len(row['messages']) > 0:
+            return row
         response = row.pop('response', None)
         if response is not None:
             if isinstance(response, (list, tuple)):
