@@ -772,6 +772,8 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
         device = self.device
         rewards_per_func = torch.zeros((len(batch), len(self.reward_funcs)), device=device)
         completions = [inp['messages'][-1]['content'] for inp in batch]
+        history = [inp['messages'][:-1] for inp in batch]
+        extra_info = [inp.get('extra_info', None) for inp in batch]
         reward_kwargs = {}  # TODO: training step info
         for i, (reward_func, reward_model_plugin, reward_func_name) in enumerate(
                 zip(self.reward_funcs, self.reward_model_plugins, self.reward_func_names)):
@@ -783,6 +785,16 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
                 else:
                     # Repeat all input columns (but "messages" and "completion") to match the number of generations
                     reward_kwargs.update(RowPreprocessor.rows_to_batched(batch))
+                    
+                    ####################################
+                    # !!!!!!!!!!!!!!!!!!!!!!!!!!!! #
+                    reward_kwargs.update({
+                        "history": history,
+                        "extra_info": extra_info
+                    })
+                    # !!!!!!!!!!!!!!!!!!!!!!!!!!!! #
+                    ####################################
+                    
                     output_reward_func = reward_func(completions, **reward_kwargs)
                 output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
